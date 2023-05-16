@@ -1,32 +1,41 @@
 resource "fastly_service_vcl" "files" {
-  name     = var.fastly_service_name
+  name = var.fastly_service_name
   # Set to false for spicy changes
-  activate = true
+  activate = false
 
   domain {
     name = var.domain
   }
 
   snippet {
-    name     = "GCS"
+    name     = "B2"
     priority = 100
-    type     = "recv"
+    type     = "miss"
     content  = <<-EOT
-        set var.GCS-Access-Key-ID = "${var.gcs_access_key_id}";
-        set var.GCS-Secret-Access-Key = "${var.gcs_secret_access_key}";
-        set var.GCS-Bucket-Name = "${var.files_bucket}";
+        set var.B2AccessKey = "${b2_application_key.primary_storage_read_key_backblaze.application_key_id}";
+        set var.B2SecretKey = "${b2_application_key.primary_storage_read_key_backblaze.application_key}";
+        set var.B2Bucket    = "${var.files_bucket}";
+        set var.B2Region = "us-east-005";
     EOT
   }
 
   snippet {
-    name     = "AWS"
+    name     = "AWS-Archive"
     priority = 100
-    type     = "recv"
+    type     = "miss"
     content  = <<-EOT
-        set var.AWS-Access-Key-ID = "${var.aws_access_key_id}";
-        set var.AWS-Secret-Access-Key = "${var.aws_secret_access_key}";
-        set var.S3-Bucket-Name = "${var.files_bucket}";
+        set var.AWSArchiveAccessKeyID = "${aws_iam_access_key.archive_storage_access_key.id}";
+        set var.AWSArchiveSecretAccessKey = "${aws_iam_access_key.archive_storage_access_key.secret}";
+        set var.AWSArchiveBucket = "${aws_s3_bucket.archive_storage_glacier_bucket.id}";
+        set var.AWSArchiveRegion = "${aws_s3_bucket.archive_storage_glacier_bucket.region}";
     EOT
+  }
+
+  snippet {
+    name     = "Linehaul"
+    priority = 100
+    type     = "log"
+    content  = "set var.Ship-Logs-To-Line-Haul = ${var.linehaul_enabled};"
   }
 
   backend {
@@ -47,18 +56,17 @@ resource "fastly_service_vcl" "files" {
   }
 
   backend {
-    name             = "GCS"
+    name = "B2"
     auto_loadbalance = false
-    shield           = "bfi-wa-us"
+    shield = "iad-va-us"
 
     request_condition = "Package File"
-    healthcheck       = "GCS Health"
 
-    address           = "${var.files_bucket}.storage.googleapis.com"
-    port              = 443
-    use_ssl           = true
-    ssl_cert_hostname = "${var.files_bucket}.storage.googleapis.com"
-    ssl_sni_hostname  = "${var.files_bucket}.storage.googleapis.com"
+    address = "${var.files_bucket}.s3.us-east-005.backblazeb2.com"
+    port = 443
+    use_ssl = true
+    ssl_cert_hostname = "${var.files_bucket}.s3.us-east-005.backblazeb2.com"
+    ssl_sni_hostname = "${var.files_bucket}.s3.us-east-005.backblazeb2.com"
 
     connect_timeout       = 5000
     first_byte_timeout    = 60000
@@ -67,85 +75,23 @@ resource "fastly_service_vcl" "files" {
   }
 
   backend {
-    name              = "S3"
+    name              = "S3_Archive"
     auto_loadbalance  = false
-    request_condition = "NeverReq"
     shield            = "bfi-wa-us"
 
-    healthcheck = "S3 Health"
+    request_condition = "NeverReq"
 
-    address           = "${var.files_bucket}.s3.amazonaws.com"
+    address           = "${var.files_bucket}-archive.s3.amazonaws.com"
     port              = 443
     use_ssl           = true
-    ssl_cert_hostname = "${var.files_bucket}.s3.amazonaws.com"
-    ssl_sni_hostname  = "${var.files_bucket}.s3.amazonaws.com"
+    ssl_cert_hostname = "${var.files_bucket}-archive.s3.amazonaws.com"
+    ssl_sni_hostname  = "${var.files_bucket}-archive.s3.amazonaws.com"
 
     connect_timeout       = 5000
     first_byte_timeout    = 60000
     between_bytes_timeout = 15000
     error_threshold       = 5
   }
-
-  backend {
-    name             = "Mirror"
-    auto_loadbalance = false
-    shield           = "london_city-uk"
-
-    request_condition = "Primary Failure (Mirror-able)"
-    healthcheck       = "Mirror Health"
-
-    address           = var.mirror
-    port              = 443
-    use_ssl           = true
-    ssl_cert_hostname = var.mirror
-    ssl_sni_hostname  = var.mirror
-
-    connect_timeout = 3000
-    error_threshold = 5
-  }
-
-  healthcheck {
-    name = "GCS Health"
-
-    host   = "${var.files_bucket}.storage.googleapis.com"
-    method = "GET"
-    path   = "/_health.txt"
-
-    check_interval = 3000
-    timeout        = 2000
-    threshold      = 2
-    initial        = 2
-    window         = 4
-  }
-
-  healthcheck {
-    name = "S3 Health"
-
-    host   = "${var.files_bucket}.s3.amazonaws.com"
-    method = "GET"
-    path   = "/_health.txt"
-
-    check_interval = 3000
-    timeout        = 2000
-    threshold      = 2
-    initial        = 2
-    window         = 4
-  }
-
-  healthcheck {
-    name = "Mirror Health"
-
-    host   = var.domain
-    method = "GET"
-    path   = "/last-modified"
-
-    check_interval = 3000
-    timeout        = 2000
-    threshold      = 2
-    initial        = 2
-    window         = 4
-  }
-
 
   vcl {
     name    = "Main"
@@ -170,6 +116,20 @@ resource "fastly_service_vcl" "files" {
     # our VCL, but we need to set it here so that the system is configured to
     # have it as a logger.
     response_condition = "Never"
+  }
+
+  logging_datadog {
+    name               = "Log Storage Fallback success"
+    token              = var.datadog_token
+    response_condition = "Storage Fallback success"
+    format             = "{ \"ddsource\": \"fastly\", \"service\": \"%%{req.service_id}V\", \"date\": \"%%{begin:%Y-%m-%dT%H:%M:%S%z}t\", \"url\": \"%%{json.escape(req.url)}V\", \"message\": \"Storage had to fetch from fallback!\", \"short_message\": \"storage_fallback\" }"
+  }
+
+  logging_datadog {
+    name               = "Log Storage Fallback failure"
+    token              = var.datadog_token
+    response_condition = "Storage Fallback failure"
+    format             = "{ \"ddsource\": \"fastly\", \"service\": \"%%{req.service_id}V\", \"date\": \"%%{begin:%Y-%m-%dT%H:%M:%S%z}t\", \"url\": \"%%{json.escape(req.url)}V\", \"message\": \"Storage failed to fetch from fallback!\", \"short_message\": \"storage_fallback_failure\" }"
   }
 
   logging_s3 {
@@ -198,10 +158,21 @@ resource "fastly_service_vcl" "files" {
   }
 
   condition {
-    name      = "Primary Failure (Mirror-able)"
-    type      = "REQUEST"
-    statement = "(!req.backend.healthy || req.restarts > 0) && req.url ~ \"^/packages/[a-f0-9]{2}/[a-f0-9]{2}/[a-f0-9]{60}/\""
-    priority  = 2
+    name      = "Storage Fallback success"
+    type      = "RESPONSE"
+    statement = "req.restarts > 0 && req.http.Fallback-Backend == \"1\" && req.url ~ \"^/packages/[a-f0-9]{2}/[a-f0-9]{2}/[a-f0-9]{60}/\" && (http_status_matches(resp.status, \"200\") || http_status_matches(resp.status, \"206\"))"
+  }
+
+  condition {
+    name      = "Storage Fallback failure"
+    type      = "RESPONSE"
+    statement = "req.restarts > 0 && req.http.Fallback-Backend == \"1\" && req.url ~ \"^/packages/[a-f0-9]{2}/[a-f0-9]{2}/[a-f0-9]{60}/\" && !(http_status_matches(resp.status, \"200\") || http_status_matches(resp.status, \"206\"))"
+  }
+
+  condition {
+    name      = "Never"
+    type      = "RESPONSE"
+    statement = "req.http.Fastly-Client-IP == \"127.0.0.1\" && req.http.Fastly-Client-IP != \"127.0.0.1\""
   }
 
   condition {
@@ -214,12 +185,6 @@ resource "fastly_service_vcl" "files" {
     name      = "5xx Error"
     type      = "RESPONSE"
     statement = "(resp.status >= 500 && resp.status < 600)"
-  }
-
-  condition {
-    name      = "Never"
-    type      = "RESPONSE"
-    statement = "req.http.Fastly-Client-IP == \"127.0.0.1\" && req.http.Fastly-Client-IP != \"127.0.0.1\""
   }
 }
 

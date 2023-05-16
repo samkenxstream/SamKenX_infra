@@ -30,7 +30,15 @@ variable "warehouse_token" {
   type      = string
   sensitive = true
 }
+variable "warehouse_ip_salt" {
+  type      = string
+  sensitive = true
+}
 variable "test_pypi_warehouse_token" {
+  type      = string
+  sensitive = true
+}
+variable "datadog_token" {
   type      = string
   sensitive = true
 }
